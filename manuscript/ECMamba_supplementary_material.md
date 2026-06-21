@@ -1,5 +1,17 @@
 # Supplementary Material for ECMamba
 
+Hongyu Duan^1^,^†^, Mianzhi Dai^2^,^†^, Tianlai Huang^3^, Jing Li^4^, Fanjie Wei^5^, Zhong Li^6^*
+
+^1^ Department of Statistics and Financial Mathematics, School of Mathematics, South China University of Technology, Guangzhou, 510640, China  
+^2^ School of Physics, Sun Yat-sen University, Guangzhou, 510275, China  
+^3^ Intelligent Speech Interaction Department, Ping An Technology, Shenzhen, China  
+^4^ Department of Operations and Medical Insurance Management, The Sixth Affiliated Hospital, Sun Yat-sen University, Guangzhou, China  
+^5^ Department of Software Engineering, School of Software Engineering, South China University of Technology, Guangzhou, 510006, China  
+^6^ Department of Neurology, The Sixth Affiliated Hospital, Sun Yat-sen University, Guangzhou, China; Key Laboratory of Human Microbiome and Chronic Diseases, Sun Yat-sen University, Ministry of Education, China; Biomedical Innovation Center, The Sixth Affiliated Hospital, Sun Yat-sen University, Guangzhou, China; Guangdong Provincial Key Laboratory of Brain Function and Disease, Guangzhou, 510080, China
+
+\*Corresponding author: lzhong@mail.sysu.edu.cn  
+^†^These authors contributed equally to this work.
+
 ## S1 Compliance note for *Bioinformatics* Application Notes
 
 This supplementary file contains material that is useful for review and reproducibility but is not essential to keep in the 4-page main text. The main article therefore retains the core scientific message: why ECMamba is needed relative to mainstream alternatives, what the main algorithmic innovations are, and how the released implementation remains easy to use. Extended methodological details, machine-learning dataset notes, benchmark tables and projected resource estimates are moved here to keep the main article consistent with the short Application Note format.

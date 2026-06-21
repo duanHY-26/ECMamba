@@ -1,10 +1,16 @@
 # ECMamba: gated fusion of protein language model and MSA-aware selective state-space representations for enzyme function annotation
 
-[Author names to be inserted]
+Hongyu Duan^1^,^†^, Mianzhi Dai^2^,^†^, Tianlai Huang^3^, Jing Li^4^, Fanjie Wei^5^, Zhong Li^6^*
 
-[Affiliations to be inserted]
+^1^ Department of Statistics and Financial Mathematics, School of Mathematics, South China University of Technology, Guangzhou, 510640, China  
+^2^ School of Physics, Sun Yat-sen University, Guangzhou, 510275, China  
+^3^ Intelligent Speech Interaction Department, Ping An Technology, Shenzhen, China  
+^4^ Department of Operations and Medical Insurance Management, The Sixth Affiliated Hospital, Sun Yat-sen University, Guangzhou, China  
+^5^ Department of Software Engineering, School of Software Engineering, South China University of Technology, Guangzhou, 510006, China  
+^6^ Department of Neurology, The Sixth Affiliated Hospital, Sun Yat-sen University, Guangzhou, China; Key Laboratory of Human Microbiome and Chronic Diseases, Sun Yat-sen University, Ministry of Education, China; Biomedical Innovation Center, The Sixth Affiliated Hospital, Sun Yat-sen University, Guangzhou, China; Guangdong Provincial Key Laboratory of Brain Function and Disease, Guangzhou, 510080, China
 
-\*To whom correspondence should be addressed: [institutional email]
+\*To whom correspondence should be addressed: lzhong@mail.sysu.edu.cn  
+^†^These authors contributed equally to this work.
 
 ## Abstract
 
