@@ -34,11 +34,7 @@ The language-model stream produces a compact pooled representation through Layer
 
 The supplied comparison benchmark shows that ECMamba achieves the best recall and F1 on both displayed datasets. On NEW-392, F1 increased from 0.592 to 0.601 relative to the strongest sequence-only multilayer perceptron baseline. On Price-149, the gain was larger, with recall increasing from 0.520 to 0.592 and F1 from 0.527 to 0.570. This pattern indicates that explicit evolutionary context is particularly helpful under stronger distribution shift, where sensitivity improves without a large loss of precision.
 
-| Method | NEW F1 | Price F1 |
-|---|---:|---:|
-| ECMamba | 0.601 | 0.570 |
-| baseline_mlp | 0.592 | 0.527 |
-| CLEAN | 0.499 | 0.495 |
+![Figure 2. Benchmark comparison on NEW-392 and Price-149.](e:/研究/ECMamba/model_comparison_full.png)
 
 ## 4 Discussion
 
