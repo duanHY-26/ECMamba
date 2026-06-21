@@ -44,9 +44,13 @@ Default training settings in the released script are 20 epochs, batch size 256, 
 
 `NR` indicates that the corresponding metric was not reported in the supplied figure for that dataset.
 
+### Figure S1. Full benchmark comparison
+
+![Figure S1. Benchmark comparison on NEW-392 and Price-149. ECMamba corresponds to the red series in the supplied composite figure.](e:/研究/ECMamba/model_comparison_full.png)
+
 ## S5 Gated-fusion equation
 
-![Figure S1. Feature-wise gated fusion used in ECMamba.](e:/研究/ECMamba/assets/ecmamba_gate_equation.png)
+![Figure S2. Feature-wise gated fusion used in ECMamba.](e:/研究/ECMamba/assets/ecmamba_gate_equation.png)
 
 The gate is initialized with a positive bias so that optimization starts from a stable preference for pretrained sequence features and only later increases the contribution of explicit evolutionary evidence where useful.
 
