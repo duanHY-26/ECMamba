@@ -1,0 +1,28 @@
+root: /path/to/project-root
+train_csv: /path/to/split100.csv
+new_csv: /path/to/new_392.csv
+price_csv: /path/to/price_149.csv
+embedding_store: /path/to/esm_features.h5
+msa_dir: /path/to/msa_directory
+out_dir: outputs/ecmamba_run
+
+epochs: 20
+batch_size: 256
+lr: 5.0e-4
+weight_decay: 1.0e-4
+warmup_epochs: 2
+selected_threshold: 0.07
+thresholds: 0.005,0.01,0.03,0.05,0.07,0.1,0.15,0.2,0.3,0.5
+
+seq_max_len: 1000
+msa_max_len: 512
+msa_max_depth: 64
+d_model: 256
+msa_d_model: 128
+msa_depth: 2
+msa_col_heads: 4
+gate_init_bias: 2.0
+
+loss: focal_bce
+focal_gamma: 2.0
+eval_datasets: NEW,PRICE

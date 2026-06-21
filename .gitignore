@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.log
+*.docx
+*.pdf
+!manuscript/*.docx
+_qa_*/
+manuscript/_qa/
+analysis_results*/
+checkpoints/
+*.pt
+*.pth
+*.h5
+*.hdf5
+build_ecmamba_application_note.py
+ChatGPT Image*.png
