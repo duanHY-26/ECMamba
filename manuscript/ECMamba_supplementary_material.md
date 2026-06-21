@@ -2,7 +2,7 @@
 
 ## S1 Compliance note for *Bioinformatics* Application Notes
 
-This supplementary file contains material that is useful for review and reproducibility but is not essential to keep in the 4-page main text. The main article therefore retains only the central software description, one benchmark figure and the key performance summary. Extended methodological details, machine-learning dataset notes, benchmark tables and projected resource estimates are moved here to keep the main article consistent with the short Application Note format.
+This supplementary file contains material that is useful for review and reproducibility but is not essential to keep in the 4-page main text. The main article therefore retains the core scientific message: why ECMamba is needed relative to mainstream alternatives, what the main algorithmic innovations are, and how the released implementation remains easy to use. Extended methodological details, machine-learning dataset notes, benchmark tables and projected resource estimates are moved here to keep the main article consistent with the short Application Note format.
 
 ## S2 Machine-learning dataset description
 
@@ -79,4 +79,4 @@ The most useful machine-readable outputs are:
 
 ## S8 Current limitations
 
-The supplied materials do not yet include multi-seed uncertainty, significance testing, ablation of the MSA stream, fixed-weight fusion controls or gate-value analysis. The benchmark figure is therefore encouraging but not yet sufficient for strong mechanistic claims. A polished journal submission should add these controls together with the archived code snapshot and, ideally, measured runtime and memory statistics.
+The supplied materials do not yet include multi-seed uncertainty, significance testing, ablation of the MSA stream, fixed-weight fusion controls or gate-value analysis. The benchmark evidence is therefore encouraging but not yet sufficient for strong mechanistic claims. A polished journal submission should add these controls together with the archived code snapshot, measured runtime and memory statistics, and a more explicit comparison against additional mainstream baselines where feasible.
