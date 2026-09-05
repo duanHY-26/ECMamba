@@ -75,7 +75,7 @@ import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, precision_recall_fscore_support, roc_auc_score, accuracy_score
 import matplotlib.pyplot as plt
 import seaborn as sns
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
 try:
@@ -1180,6 +1180,93 @@ class MSAEncoder(nn.Module):
         ], dim=-1)
 
 
+def compute_msa_quality_features(
+    msa_tokens: torch.Tensor,
+    msa_mask: torch.Tensor,
+    msa_row_mask: torch.Tensor,
+    max_depth: int,
+) -> torch.Tensor:
+    """Compute explicit, label-free MSA reliability features Q for each sample.
+
+    Q = [
+        normalized_homolog_depth,
+        mean_query_coverage,
+        non_gap_fraction,
+        mean_query_identity,
+        max_query_identity,
+        query_identity_std,
+    ]
+
+    All quantities are derived only from the input MSA and never use EC labels.
+    A depth-1 query-only fallback therefore receives zero homolog-depth/identity/
+    coverage evidence, allowing the gate to learn that evolutionary evidence is
+    unavailable rather than pretending the pseudo-MSA is a real alignment.
+    """
+    if msa_tokens.ndim != 3:
+        raise ValueError(f"msa_tokens must be [B,N,L], got {tuple(msa_tokens.shape)}")
+    B, N, _L = msa_tokens.shape
+    device = msa_tokens.device
+    dtype = torch.float32
+
+    row_mask = msa_row_mask.bool()
+    valid = msa_mask.bool()
+    residue = valid & msa_tokens.ne(MSA_GAP_IDX)
+
+    depth = row_mask.sum(dim=1).to(dtype)
+    homolog_count = (depth - 1.0).clamp_min(0.0)
+    denom_depth = math.log1p(float(max(max_depth - 1, 1)))
+    depth_norm = torch.log1p(homolog_count) / max(denom_depth, 1e-8)
+    depth_norm = depth_norm.clamp(0.0, 1.0)
+
+    non_gap_fraction = residue.sum(dim=(1, 2)).to(dtype) / valid.sum(dim=(1, 2)).clamp_min(1).to(dtype)
+
+    if N <= 1:
+        z = torch.zeros(B, dtype=dtype, device=device)
+        return torch.stack([depth_norm, z, non_gap_fraction, z, z, z], dim=-1)
+
+    query_tokens = msa_tokens[:, 0, :]
+    query_residue = residue[:, 0, :]
+    homolog_tokens = msa_tokens[:, 1:, :]
+    homolog_residue = residue[:, 1:, :]
+
+    overlap = homolog_residue & query_residue.unsqueeze(1)
+    overlap_count = overlap.sum(dim=2)
+    valid_homolog = row_mask[:, 1:] & overlap_count.gt(0)
+    vh = valid_homolog.to(dtype)
+    n_valid_homolog = vh.sum(dim=1).clamp_min(1.0)
+
+    matches = homolog_tokens.eq(query_tokens.unsqueeze(1)) & overlap
+    identity = matches.sum(dim=2).to(dtype) / overlap_count.clamp_min(1).to(dtype)
+    query_residue_count = query_residue.sum(dim=1, keepdim=True).clamp_min(1).to(dtype)
+    coverage = overlap_count.to(dtype) / query_residue_count
+
+    mean_identity = (identity * vh).sum(dim=1) / n_valid_homolog
+    mean_coverage = (coverage * vh).sum(dim=1) / n_valid_homolog
+
+    masked_identity = identity.masked_fill(~valid_homolog, -1.0)
+    max_identity = masked_identity.max(dim=1).values.clamp_min(0.0)
+
+    centered = identity - mean_identity.unsqueeze(1)
+    identity_var = ((centered * centered) * vh).sum(dim=1) / n_valid_homolog
+    identity_std = torch.sqrt(identity_var.clamp_min(0.0))
+
+    has_homolog = valid_homolog.any(dim=1).to(dtype)
+    mean_identity = mean_identity * has_homolog
+    mean_coverage = mean_coverage * has_homolog
+    max_identity = max_identity * has_homolog
+    identity_std = identity_std * has_homolog
+
+    q = torch.stack([
+        depth_norm,
+        mean_coverage.clamp(0.0, 1.0),
+        non_gap_fraction.clamp(0.0, 1.0),
+        mean_identity.clamp(0.0, 1.0),
+        max_identity.clamp(0.0, 1.0),
+        identity_std.clamp(0.0, 1.0),
+    ], dim=-1)
+    return torch.nan_to_num(q, nan=0.0, posinf=1.0, neginf=0.0)
+
+
 class MSAESMGatedClassifier(nn.Module):
     """ESM2 pooled/projection branch + MSA-Mamba encoder branch with learnable gated fusion.
 
@@ -1219,6 +1306,9 @@ class MSAESMGatedClassifier(nn.Module):
         msa_mamba_expand: int = 1,
         gate_init_bias: float = 2.0,
         classifier_hidden_dim: int = 512,
+        fusion_mode: str = "feature",
+        fixed_esm_weight: float = 0.5,
+        quality_hidden_dim: int = 64,
     ) -> None:
         super().__init__()
         if not HAS_MAMBA:
@@ -1227,6 +1317,15 @@ class MSAESMGatedClassifier(nn.Module):
         self.input_dim = int(input_dim)
         self.d_model = int(d_model)
         self.msa_d_model = int(msa_d_model)
+        self.msa_max_depth = int(msa_max_depth)
+        self.fusion_mode = str(fusion_mode).lower().strip()
+        if self.fusion_mode not in {"fixed", "scalar", "feature", "quality"}:
+            raise ValueError(f"Unsupported fusion_mode={fusion_mode}. Choose fixed/scalar/feature/quality.")
+        self.fixed_esm_weight = float(fixed_esm_weight)
+        if not (0.0 <= self.fixed_esm_weight <= 1.0):
+            raise ValueError("fixed_esm_weight must be in [0,1].")
+        self.quality_feature_dim = 6
+        self.quality_hidden_dim = int(quality_hidden_dim)
 
         # ESM2 branch: lightweight projection + masked pooling only.
         # No ESM-side Mamba/ConvNeXt/Hybrid blocks are constructed here.
@@ -1263,10 +1362,32 @@ class MSAESMGatedClassifier(nn.Module):
             nn.Dropout(dropout),
         )
 
-        gate_in_dim = pooled_dim * 4
-        self.gate_norm = nn.LayerNorm(gate_in_dim)
-        self.gate_linear = nn.Linear(gate_in_dim, pooled_dim)
-        nn.init.constant_(self.gate_linear.bias, float(gate_init_bias))
+        # Fusion ablations share the same two branch encoders and classifier.
+        # fixed   : fixed convex mixture (default ESM weight 0.5)
+        # scalar  : one learned gate value per protein
+        # feature : original feature-wise implicit gate
+        # quality : feature-wise gate explicitly conditioned on label-free MSA quality Q
+        base_gate_in_dim = pooled_dim * 4
+        self.quality_encoder: Optional[nn.Module]
+        if self.fusion_mode == "quality":
+            self.quality_encoder = nn.Sequential(
+                nn.LayerNorm(self.quality_feature_dim),
+                nn.Linear(self.quality_feature_dim, self.quality_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            gate_in_dim = base_gate_in_dim + self.quality_hidden_dim
+        else:
+            self.quality_encoder = None
+            gate_in_dim = base_gate_in_dim
+
+        self.gate_norm: Optional[nn.Module] = None
+        self.gate_linear: Optional[nn.Linear] = None
+        if self.fusion_mode in {"scalar", "feature", "quality"}:
+            self.gate_norm = nn.LayerNorm(gate_in_dim)
+            gate_out_dim = 1 if self.fusion_mode == "scalar" else pooled_dim
+            self.gate_linear = nn.Linear(gate_in_dim, gate_out_dim)
+            nn.init.constant_(self.gate_linear.bias, float(gate_init_bias))
         self.fusion_norm = nn.LayerNorm(pooled_dim)
 
         self.classifier = nn.Sequential(
@@ -1307,8 +1428,33 @@ class MSAESMGatedClassifier(nn.Module):
     ) -> torch.Tensor:
         esm_feat = self.encode_esm(emb, esm_mask)
         msa_feat = self.msa_to_esm(self.msa_encoder(msa_tokens, msa_mask, msa_row_mask))
-        gate_input = torch.cat([esm_feat, msa_feat, torch.abs(esm_feat - msa_feat), esm_feat * msa_feat], dim=-1)
-        gate = torch.sigmoid(self.gate_linear(self.gate_norm(gate_input)))
+
+        if self.fusion_mode == "fixed":
+            gate = torch.full(
+                (esm_feat.shape[0], 1),
+                self.fixed_esm_weight,
+                dtype=esm_feat.dtype,
+                device=esm_feat.device,
+            )
+        else:
+            gate_input = torch.cat([
+                esm_feat,
+                msa_feat,
+                torch.abs(esm_feat - msa_feat),
+                esm_feat * msa_feat,
+            ], dim=-1)
+            if self.fusion_mode == "quality":
+                q = compute_msa_quality_features(
+                    msa_tokens=msa_tokens,
+                    msa_mask=msa_mask,
+                    msa_row_mask=msa_row_mask,
+                    max_depth=self.msa_max_depth,
+                ).to(dtype=esm_feat.dtype)
+                assert self.quality_encoder is not None
+                gate_input = torch.cat([gate_input, self.quality_encoder(q)], dim=-1)
+            assert self.gate_norm is not None and self.gate_linear is not None
+            gate = torch.sigmoid(self.gate_linear(self.gate_norm(gate_input)))
+
         fused = gate * esm_feat + (1.0 - gate) * msa_feat
         fused = self.fusion_norm(fused)
         return self.classifier(fused)
@@ -1620,6 +1766,27 @@ def compute_per_label_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold:
     return rows
 
 
+
+def choose_threshold_from_calibration(
+    rows: List[Dict[str, Any]],
+    metric: str = "weighted_f1_score",
+) -> Tuple[float, Dict[str, Any]]:
+    """Choose one global threshold using only the inner calibration split."""
+    valid_rows: List[Tuple[float, float, Dict[str, Any]]] = []
+    for r in rows:
+        try:
+            score = float(r.get(metric, float("nan")))
+            thr = float(r["threshold"])
+        except Exception:
+            continue
+        if np.isfinite(score):
+            valid_rows.append((score, thr, r))
+    if not valid_rows:
+        raise RuntimeError(f"No finite calibration rows for metric={metric}")
+    # Primary key: metric. Tie-breaker: smaller threshold for deterministic behavior.
+    score, thr, best = max(valid_rows, key=lambda x: (x[0], -x[1]))
+    return float(thr), dict(best)
+
 def add_context(row: Dict[str, Any], dataset: str, model: str) -> Dict[str, Any]:
     out = {"dataset": dataset, "model": model}
     out.update(row)
@@ -1682,11 +1849,13 @@ def print_summary_table(summary_rows: List[Dict[str, Any]]) -> None:
 # =============================================================================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ESM2 pooled embedding + MSA-Mamba gated fusion EC multi-label training/evaluation; train on split100 and evaluate on NEW/PRICE only.")
+    parser = argparse.ArgumentParser(description="ESM2 pooled embedding + MSA-Mamba gated fusion EC multi-label training/evaluation; train on split100 and evaluate on NEW, PRICE, and/or one named external holdout.")
     parser.add_argument("--root", type=str, default="/nfs/hb236/dhy/app")
     parser.add_argument("--train_csv", type=str, default=None)
     parser.add_argument("--new_csv", type=str, default=None)
     parser.add_argument("--price_csv", type=str, default=None)
+    parser.add_argument("--external_eval_csv", type=str, default=None, help="Optional fixed external evaluation CSV/TSV. It is never used for training, threshold selection, or early stopping.")
+    parser.add_argument("--external_eval_name", type=str, default="EXTERNAL", help="Dataset name used with --external_eval_csv, for example ECBENCH2023.")
     parser.add_argument("--esm_dir", type=str, required=True, help="Comma-separated ESM embedding directories/files.")
     parser.add_argument("--sequence_col", type=str, default=None, help="Optional query sequence column used only as a fallback when an MSA file is missing. If omitted, common names such as Sequence/sequence/seq are inferred when needed.")
     parser.add_argument("--msa_dir", type=str, default="", help="Comma-separated MSA directories/files. Expected one .a3m/.fasta/.fa file per protein ID. If empty, the model falls back to single-sequence MSA from --sequence_col.")
@@ -1725,7 +1894,10 @@ def main() -> None:
     parser.add_argument("--mamba_d_conv", type=int, default=4)
     parser.add_argument("--mamba_expand", type=int, default=2)
     parser.add_argument("--msa_mamba_expand", type=int, default=1, help="Mamba expand factor for row-wise MSA branch. Recommended 1 for speed.")
-    parser.add_argument("--gate_init_bias", type=float, default=2.0, help="Initial fusion gate bias. Positive values make fusion prefer ESM at the start; 2.0 means about 88%% ESM.")
+    parser.add_argument("--gate_init_bias", type=float, default=2.0, help="Initial learned gate bias. Positive values make learned fusion prefer ESM at initialization.")
+    parser.add_argument("--fusion_mode", type=str, default="quality", choices=["fixed", "scalar", "feature", "quality"], help="Fusion ablation: fixed mixture, scalar adaptive gate, original feature-wise gate, or explicit MSA-quality-conditioned feature-wise gate.")
+    parser.add_argument("--fixed_esm_weight", type=float, default=0.5, help="ESM weight for --fusion_mode fixed.")
+    parser.add_argument("--quality_hidden_dim", type=int, default=64, help="Hidden size used to encode six explicit label-free MSA quality features for --fusion_mode quality.")
     parser.add_argument("--loss", type=str, default="focal_bce", choices=["asl", "bce", "weighted_bce", "focal_bce"])
     parser.add_argument("--asl_gamma_neg", type=float, default=4.0)
     parser.add_argument("--asl_gamma_pos", type=float, default=0.0)
@@ -1734,7 +1906,9 @@ def main() -> None:
     parser.add_argument("--pos_weight_mode", type=str, default="log", choices=["none", "sqrt", "log", "raw"])
     parser.add_argument("--pos_weight_max", type=float, default=8.0)
     parser.add_argument("--thresholds", type=str, default="0.005,0.01,0.03,0.05,0.07,0.1,0.15,0.2,0.3,0.5")
-    parser.add_argument("--selected_threshold", type=float, default=0.07)
+    parser.add_argument("--selected_threshold", type=float, default=0.07, help="Fallback reporting threshold used only when --val_fraction is 0.")
+    parser.add_argument("--val_fraction", type=float, default=0.10, help="Fraction of TRAIN held out for threshold calibration. NEW/PRICE are never used for threshold selection.")
+    parser.add_argument("--threshold_select_metric", type=str, default="weighted_f1_score", choices=["weighted_f1_score", "micro_f1_score", "macro_f1_score_present_labels"], help="Calibration metric used to choose the global decision threshold.")
     parser.add_argument("--rare_train_support_max", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic", action="store_true")
@@ -1742,6 +1916,8 @@ def main() -> None:
     parser.add_argument("--out_dir", type=str, default="/nfs/hb236/dhy/app-copy/analysis_results_esm2_3b_mamba_split100_focal")
     parser.add_argument("--save_checkpoint", action="store_true")
     args = parser.parse_args()
+
+    print("[ECMamba Reliability Fusion] fixed/scalar/feature/explicit-Q ablations + calibration-selected threshold")
 
     if not HAS_MAMBA:
         raise ImportError("This gated model uses an MSA encoder with row-wise Mamba mixing, so mamba-ssm is required. Install it with `pip install mamba-ssm`.")
@@ -1764,17 +1940,27 @@ def main() -> None:
     train_csv = args.train_csv or get_full_path(args.root, "split100")
     new_csv = args.new_csv or get_full_path(args.root, "new")
     price_csv = args.price_csv or get_full_path(args.root, "price")
+    external_name = args.external_eval_name.strip().upper()
+    if not external_name:
+        raise ValueError("--external_eval_name cannot be empty.")
+    if external_name in {"NEW", "PRICE"}:
+        raise ValueError("--external_eval_name must differ from NEW and PRICE.")
     print("\nCSV paths:")
     print(f"  train(split100): {train_csv}")
     print(f"  new           : {new_csv}")
     print(f"  price         : {price_csv}")
+    if args.external_eval_csv:
+        print(f"  {external_name.lower():<14}: {args.external_eval_csv}")
 
     eval_names = [x.strip().upper() for x in args.eval_datasets.split(",") if x.strip()]
-    bad = [x for x in eval_names if x not in {"NEW", "PRICE"}]
+    allowed_eval_names = {"NEW", "PRICE", external_name}
+    bad = [x for x in eval_names if x not in allowed_eval_names]
     if bad:
-        raise ValueError(f"Unknown eval datasets: {bad}. This split100 script supports evaluation on NEW and/or PRICE only; HARD data are intentionally not used.")
+        raise ValueError(f"Unknown eval datasets: {bad}. Use NEW, PRICE, and/or {external_name}.")
     if not eval_names:
-        raise ValueError("--eval_datasets cannot be empty. Use NEW, PRICE, or NEW,PRICE.")
+        raise ValueError(f"--eval_datasets cannot be empty. Use NEW, PRICE, {external_name}, or a comma-separated combination.")
+    if external_name in eval_names and not args.external_eval_csv:
+        raise ValueError(f"--external_eval_csv is required when --eval_datasets includes {external_name}.")
     print(f"Eval datasets: {eval_names}")
 
     esm_paths = split_paths(args.esm_dir)
@@ -1783,6 +1969,12 @@ def main() -> None:
     emb_store = ESMEmbeddingStore(esm_paths, esm_layer=args.esm_layer, repr_type=args.esm_repr, recursive=args.recursive_esm_search)
     msa_paths = split_paths(args.msa_dir)
     msa_store = MSAStore(msa_paths, recursive=args.recursive_msa_search) if msa_paths else None
+    if not msa_paths:
+        print("[WARNING] --msa_dir is empty: every sample without an indexed MSA will use the query-only depth-1 fallback. "
+              "For a real-MSA reliability ablation, pass the actual MSA directories with --msa_dir.")
+    elif args.fusion_mode == "quality":
+        print("Explicit-Q fusion enabled: Q is computed from MSA depth, query coverage, non-gap fraction, "
+              "mean/max query identity, and identity dispersion; EC labels are never used in Q.")
     if msa_store is None:
         print("[MSA] --msa_dir not provided; using query sequence as depth-1 MSA fallback for all samples.")
 
@@ -1798,6 +1990,8 @@ def main() -> None:
     print(f"Raw train label support: min={train_support_raw.min() if len(train_support_raw) else 0}, median={np.median(train_support_raw) if len(train_support_raw) else 0:.1f}, max={train_support_raw.max() if len(train_support_raw) else 0}")
 
     eval_path_map = {"NEW": new_csv, "PRICE": price_csv}
+    if args.external_eval_csv:
+        eval_path_map[external_name] = args.external_eval_csv
     id_dicts: Dict[str, Dict[str, Any]] = {"TRAIN": id_ec_train}
     id_seq_dicts: Dict[str, Dict[str, str]] = {"TRAIN": id_seq_train}
     for name in eval_names:
@@ -1836,6 +2030,7 @@ def main() -> None:
             "msa_fallback_to_sequence": allow_msa_fallback,
             "esm_repr": args.esm_repr,
             "esm_layer": args.esm_layer,
+            "fusion_mode": args.fusion_mode,
         })
         dataset_info_rows.append(info)
         print(f"[{name}] {json.dumps(info, ensure_ascii=False)}")
@@ -1852,9 +2047,31 @@ def main() -> None:
     if input_dim != 2560:
         print(f"[WARNING] ESM2-3B embedding dimension is usually 2560, but detected/input dimension is {input_dim}.")
 
-    id_ec_train_used = {sid: ecs for sid, ecs, _fallback_seq, _has_msa in train_dataset.samples}
+    if not (0.0 <= args.val_fraction < 1.0):
+        raise ValueError("--val_fraction must be in [0,1).")
+    split_gen = torch.Generator().manual_seed(args.seed + 99173)
+    n_total_train = len(train_dataset)
+    if args.val_fraction > 0.0 and n_total_train >= 2:
+        n_val = max(1, int(round(n_total_train * args.val_fraction)))
+        n_val = min(n_val, n_total_train - 1)
+        perm = torch.randperm(n_total_train, generator=split_gen).tolist()
+        val_indices = perm[:n_val]
+        fit_indices = perm[n_val:]
+        fit_dataset = Subset(train_dataset, fit_indices)
+        calibration_dataset: Optional[Dataset] = Subset(train_dataset, val_indices)
+    else:
+        fit_indices = list(range(n_total_train))
+        val_indices = []
+        fit_dataset = train_dataset
+        calibration_dataset = None
+
+    id_ec_train_used = {
+        train_dataset.samples[i][0]: train_dataset.samples[i][1]
+        for i in fit_indices
+    }
     train_support = compute_label_support(id_ec_train_used, ec2idx)
-    print(f"Used train label support: min={train_support.min() if len(train_support) else 0}, median={np.median(train_support) if len(train_support) else 0:.1f}, max={train_support.max() if len(train_support) else 0}")
+    print(f"Fit/calibration split: fit={len(fit_indices):,}, calibration={len(val_indices):,}, val_fraction={args.val_fraction:.3f}")
+    print(f"Used fit label support: min={train_support.min() if len(train_support) else 0}, median={np.median(train_support) if len(train_support) else 0:.1f}, max={train_support.max() if len(train_support) else 0}")
 
     g = torch.Generator()
     g.manual_seed(args.seed)
@@ -1869,7 +2086,8 @@ def main() -> None:
     if args.num_workers > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
-    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+    train_loader = DataLoader(fit_dataset, shuffle=True, **loader_kwargs)
+    calibration_loader = DataLoader(calibration_dataset, shuffle=False, **loader_kwargs) if calibration_dataset is not None else None
     test_loaders: Dict[str, DataLoader] = {}
     skipped_empty: List[str] = []
     for name, ds in datasets.items():
@@ -1884,14 +2102,14 @@ def main() -> None:
     if not test_loaders:
         raise RuntimeError("No non-empty evaluation datasets. Cannot evaluate.")
 
-    pos_weight = build_pos_weight(train_support, len(train_dataset), device, args.pos_weight_mode, args.pos_weight_max)
+    pos_weight = build_pos_weight(train_support, len(fit_dataset), device, args.pos_weight_mode, args.pos_weight_max)
     if pos_weight is not None:
         print(f"Prepared pos_weight: mode={args.pos_weight_mode}, max={args.pos_weight_max}, min/median/max={pos_weight.min().item():.3f}/{pos_weight.median().item():.3f}/{pos_weight.max().item():.3f}")
     criterion = build_criterion(args, pos_weight)
     print(f"Using loss: {args.loss}")
-    print("Architecture: ESM2 branch = LayerNorm + Linear + masked pooling only; MSA branch = axial encoder with row-wise Mamba + column attention.")
+    print(f"Architecture: ESM2 pooled prior + axial MSA-Mamba evidence; fusion_mode={args.fusion_mode}.")
 
-    model_name = f"MSAMamba_ESM2Pooled_Gated_Split100_{args.loss}"
+    model_name = f"MSAMamba_ESM2Pooled_{args.fusion_mode.upper()}Fusion_Split100_{args.loss}"
     print(f"\n>>> Training {model_name}")
     model = MSAESMGatedClassifier(
         num_labels=num_labels,
@@ -1918,14 +2136,45 @@ def main() -> None:
         msa_mamba_expand=args.msa_mamba_expand,
         gate_init_bias=args.gate_init_bias,
         classifier_hidden_dim=args.classifier_hidden_dim,
+        fusion_mode=args.fusion_mode,
+        fixed_esm_weight=args.fixed_esm_weight,
+        quality_hidden_dim=args.quality_hidden_dim,
     )
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     model = train_model(model, train_loader, device, args.epochs, args.lr, args.weight_decay, args.grad_clip, criterion, args.warmup_epochs, args.min_lr_ratio)
 
+    # Select the global decision threshold on an inner calibration split only.
+    reporting_threshold = float(args.selected_threshold)
+    calibration_rows: List[Dict[str, Any]] = []
+    calibration_best: Dict[str, Any] = {}
+    if calibration_loader is not None:
+        print("\n>>> Calibrating decision threshold on held-out TRAIN split (never NEW/PRICE)")
+        cal_logits, cal_true, _cal_ids = predict_logits(model, calibration_loader, device)
+        cal_prob = sigmoid_np(cal_logits)
+        calibration_rows = compute_metrics_for_thresholds(cal_true, cal_prob, thresholds, train_support, args.rare_train_support_max)
+        reporting_threshold, calibration_best = choose_threshold_from_calibration(
+            calibration_rows, metric=args.threshold_select_metric
+        )
+        write_csv(os.path.join(args.out_dir, "threshold_calibration_sweep.csv"), [
+            add_context(r, "CALIBRATION", model_name) for r in calibration_rows
+        ])
+        with open(os.path.join(args.out_dir, "threshold_calibration.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "selected_threshold": reporting_threshold,
+                "selection_metric": args.threshold_select_metric,
+                "best_row": calibration_best,
+                "fit_samples": len(fit_indices),
+                "calibration_samples": len(val_indices),
+                "seed": args.seed,
+            }, f, indent=2, ensure_ascii=False)
+        print(f"Calibration-selected threshold={reporting_threshold:.6g} by {args.threshold_select_metric}={float(calibration_best[args.threshold_select_metric]):.6f}")
+    else:
+        print(f"[WARNING] No calibration split; using --selected_threshold={reporting_threshold:.6g}")
+
     if args.save_checkpoint:
         ckpt_dir = os.path.join(args.out_dir, "checkpoints")
         ensure_dir(ckpt_dir)
-        torch.save({"model_state_dict": model.state_dict(), "args": vars(args), "ec_labels": all_ec, "input_dim": input_dim, "msa_alphabet": MSA_ALPHABET}, os.path.join(ckpt_dir, "msa_encoder_esm2_3b_gated_split100_model.pt"))
+        torch.save({"model_state_dict": model.state_dict(), "args": vars(args), "ec_labels": all_ec, "input_dim": input_dim, "msa_alphabet": MSA_ALPHABET, "reporting_threshold": reporting_threshold}, os.path.join(ckpt_dir, "msa_encoder_esm2_3b_gated_split100_model.pt"))
 
     all_metric_rows: List[Dict[str, Any]] = []
     all_per_label_rows: List[Dict[str, Any]] = []
@@ -1935,17 +2184,17 @@ def main() -> None:
         y_prob = sigmoid_np(logits)
         metric_rows = compute_metrics_for_thresholds(y_true, y_prob, thresholds, train_support, args.rare_train_support_max)
         all_metric_rows.extend([add_context(r, dataset_name, model_name) for r in metric_rows])
-        all_per_label_rows.extend(compute_per_label_metrics(y_true, y_prob, args.selected_threshold, all_ec, train_support, dataset_name, model_name))
+        all_per_label_rows.extend(compute_per_label_metrics(y_true, y_prob, reporting_threshold, all_ec, train_support, dataset_name, model_name))
 
     metrics_path = os.path.join(args.out_dir, "metrics_threshold_sweep.csv")
     write_csv(metrics_path, all_metric_rows)
-    summary_rows = select_threshold_rows(all_metric_rows, args.selected_threshold)
-    summary_path = os.path.join(args.out_dir, "summary_at_selected_threshold.csv")
+    summary_rows = select_threshold_rows(all_metric_rows, reporting_threshold)
+    summary_path = os.path.join(args.out_dir, "summary_at_calibrated_threshold.csv")
     write_csv(summary_path, summary_rows)
     best_metrics = ["micro_precision", "micro_recall", "micro_f1_score", "weighted_precision", "weighted_recall", "weighted_f1_score", "exact_match_accuracy", "roc_auc_weighted_supported", "macro_precision_present_labels", "macro_recall_present_labels", "macro_f1_score_present_labels", "rare_macro_precision", "rare_macro_recall", "rare_macro_f1_score", "auprc_micro_supported", "auprc_macro_supported", "auprc_weighted_supported"]
     best_path = os.path.join(args.out_dir, "best_threshold_on_test_for_diagnosis_only.csv")
     write_csv(best_path, best_threshold_diagnostics(all_metric_rows, best_metrics))
-    per_label_path = os.path.join(args.out_dir, "per_label_metrics_at_selected_threshold.csv")
+    per_label_path = os.path.join(args.out_dir, "per_label_metrics_at_calibrated_threshold.csv")
     write_csv(per_label_path, all_per_label_rows)
     with open(os.path.join(args.out_dir, "run_config.json"), "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
@@ -1959,7 +2208,7 @@ def main() -> None:
     print(f"Best-threshold diagnostics:{best_path}")
     print(f"Per-label metrics:         {per_label_path}")
     print("\nImportant: best_threshold_on_test_for_diagnosis_only.csv is diagnostic only.")
-    print("For final reporting, select thresholds on an inner calibration split, not on test sets.")
+    print(f"Final reporting threshold={reporting_threshold:.6g}; source={'inner calibration split' if calibration_loader is not None else '--selected_threshold fallback'}.")
 
     # --- CLEAN-style ICML Plot ---
     try:
